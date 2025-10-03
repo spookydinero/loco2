@@ -31,22 +31,30 @@ interface ShopState {
   approvals: Approval[];
   coreItems: CoreItem[];
 
-  // Computed selectors
-  getOpenLifts: () => Lift[];
-  getOverdueROs: () => RO[];
-  getTechWorkload: () => Record<string, number>;
-  getLowStockParts: () => Part[];
-  getEntityKPIs: () => {
-    totalEntities: number;
-    totalROs: number;
-    openROs: number;
-    completedROs: number;
-    completionRate: number;
-    lowStockParts: number;
-    availableLifts: number;
-    busyTechs: number;
-    totalRevenue: number;
-  };
+      // Computed selectors
+      getOpenLifts: (entityId?: string) => Lift[];
+      getOverdueROs: (entityId?: string) => RO[];
+      getTechWorkload: (entityId?: string) => Record<string, number>;
+      getLowStockParts: (entityId?: string) => Part[];
+      getEntityKPIs: (entityId?: string) => Record<string, number>;
+      getLiftBoardData: (entityId?: string) => Array<{
+        lift: Lift;
+        currentRO?: RO;
+        currentVehicle?: Vehicle;
+        assignedTech?: Tech;
+        currentPhase?: { id: string; name: string; order: number };
+        daysInRepair: number;
+        isOverdue: boolean;
+      }>;
+      getAlertCount: (entityId?: string) => number;
+
+      // KPI selectors (computed to prevent infinite loops)
+      utilizationPct: number;
+      avgWaitHrs: number;
+      overdueCount: number;
+      cycleTimeP50: number;
+      comebackRate: number;
+      ploopActual: number;
 
   // Actions
   assignTech: (roId: string, techId: string, phaseId?: string) => void;
@@ -588,6 +596,53 @@ const seedCoreItems: CoreItem[] = [
   }
 ];
 
+// Helper function to calculate KPIs
+const calculateKPIs = (state: Pick<ShopState, 'lifts' | 'ros' | 'estimates'>) => {
+  const { lifts, ros, estimates } = state;
+
+  // Utilization percentage
+  const totalLifts = lifts.length;
+  const occupiedLifts = lifts.filter(lift => lift.status === 'occupied').length;
+  const utilizationPct = totalLifts > 0 ? Math.round((occupiedLifts / totalLifts) * 100 * 10) / 10 : 0;
+
+  // Average wait hours
+  const completedROs = ros.filter(ro => ro.status === 'completed' || ro.status === 'closed');
+  const avgWaitHrs = completedROs.length > 0
+    ? completedROs.reduce((sum, ro) => sum + (ro.daysInRepair || 0), 0) / completedROs.length
+    : 0;
+
+  // Overdue count
+  const overdueCount = ros.filter(ro => ro.isOverdue).length;
+
+  // Cycle time P50 (median)
+  const cycleTimes = completedROs
+    .map(ro => ro.daysInRepair || 0)
+    .filter(time => time > 0)
+    .sort((a, b) => a - b);
+  const cycleTimeP50 = cycleTimes.length > 0 ? Math.round(cycleTimes[Math.floor(cycleTimes.length / 2)] * 24 * 10) / 10 : 0;
+
+  // Comeback rate
+  const reworkROs = ros.filter(ro => ro.isRework).length;
+  const comebackRate = completedROs.length > 0 ? Math.round((reworkROs / completedROs.length) * 100 * 10) / 10 : 0;
+
+  // PLOOP actual
+  const filteredEstimates = estimates.filter(est =>
+    ros.some(ro => ro.id === est.roId)
+  );
+  const totalEstimated = filteredEstimates.reduce((sum, est) => sum + est.grandTotal, 0);
+  const totalCost = filteredEstimates.reduce((sum, est) => sum + est.partsTotal + est.laborTotal, 0);
+  const ploopActual = totalEstimated > 0 ? Math.round(((totalEstimated - totalCost) / totalEstimated) * 100 * 10) / 10 : 0;
+
+  return {
+    utilizationPct,
+    avgWaitHrs: Math.round(avgWaitHrs * 10) / 10,
+    overdueCount,
+    cycleTimeP50,
+    comebackRate,
+    ploopActual
+  };
+};
+
 export const useShop = create<ShopState>()(
   devtools(
     (set, get) => ({
@@ -603,6 +658,13 @@ export const useShop = create<ShopState>()(
       estimates: seedEstimates,
       approvals: seedApprovals,
       coreItems: seedCoreItems,
+
+      // Computed KPI values (updated via getters)
+      ...calculateKPIs({
+        lifts: seedLifts,
+        ros: seedROs,
+        estimates: seedEstimates
+      }),
 
       // Computed selectors
       getOpenLifts: () => {
@@ -666,6 +728,57 @@ export const useShop = create<ShopState>()(
           busyTechs,
           totalRevenue: estimates.reduce((sum, est) => sum + est.grandTotal, 0)
         };
+      },
+
+      getLiftBoardData: () => {
+        const { lifts, ros, vehicles, techs, entities } = get();
+
+        return lifts.map(lift => {
+          const currentRO = lift.currentRO ? ros.find(ro => ro.id === lift.currentRO) : undefined;
+          const currentVehicle = currentRO ? vehicles.find(v => v.id === currentRO.vehicleId) : undefined;
+          const assignedTech = currentRO?.assignedTechs && currentRO.assignedTechs.length > 0 ? techs.find(t => t.id === currentRO.assignedTechs[0]) : undefined;
+
+          // Calculate days in repair
+          const daysInRepair = currentRO ? Math.floor((Date.now() - currentRO.createdAt.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+
+          // Check if overdue
+          const isOverdue = currentRO?.estimatedCompletion ? currentRO.estimatedCompletion < new Date() : false;
+
+          // Determine current phase (simplified - in real app this would be more complex)
+          let currentPhaseId = '';
+          if (currentRO) {
+            const inProgressPhases = currentRO.phases.filter(p => p.status === 'in_progress');
+            if (inProgressPhases.length > 0) {
+              // Map existing phases to our standard phases
+              const phaseName = inProgressPhases[0].name.toLowerCase();
+              if (phaseName.includes('inspection') || phaseName.includes('pull')) currentPhaseId = 'pull';
+              else if (phaseName.includes('diagnostic') || phaseName.includes('diagnose')) currentPhaseId = 'diagnose';
+              else if (phaseName.includes('build') || phaseName.includes('repair')) currentPhaseId = 'build';
+              else if (phaseName.includes('reinstall') || phaseName.includes('install')) currentPhaseId = 'reinstall';
+              else if (phaseName.includes('test')) currentPhaseId = 'test_drive';
+              else currentPhaseId = 'diagnose'; // default
+            }
+          }
+
+          const phaseMap: Record<string, { name: string; order: number }> = {
+            pull: { name: 'Pull', order: 1 },
+            diagnose: { name: 'Diagnose', order: 2 },
+            build: { name: 'Build', order: 3 },
+            reinstall: { name: 'Reinstall', order: 4 },
+            test_drive: { name: 'Test Drive', order: 5 },
+            complete: { name: 'Complete', order: 6 }
+          };
+
+          return {
+            lift,
+            currentRO,
+            currentVehicle,
+            assignedTech,
+            currentPhase: currentPhaseId ? { id: currentPhaseId, ...phaseMap[currentPhaseId] } : undefined,
+            daysInRepair,
+            isOverdue
+          };
+        });
       },
 
       // Action stubs
@@ -738,12 +851,12 @@ export const useShop = create<ShopState>()(
         }));
       },
 
-      requestApproval: (entityId: string, entityType: 'estimate' | 'po' | 'ro', amount?: number) => {
+      requestApproval: (entityId: string, entityType: string, amount?: number) => {
         console.log(`Requesting approval for ${entityType} ${entityId}`, amount ? `amount: ${amount}` : '');
         const newApproval: Approval = {
           id: `app-${Date.now()}`,
           entityId,
-          entityType,
+          entityType: entityType as any,
           requestedBy: 'system', // Would be current user in real app
           status: 'pending',
           amount,
@@ -778,6 +891,12 @@ export const useShop = create<ShopState>()(
               : ro
           )
         }));
+      },
+
+      getAlertCount: (entityId?: string) => {
+        const state = get()
+        // Note: Alerts have optional entityId, but for now return all unread alerts
+        return state.alerts.filter(alert => !alert.isRead).length
       }
     }),
     {

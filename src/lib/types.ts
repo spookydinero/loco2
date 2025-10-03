@@ -82,6 +82,11 @@ export interface RO {
   totalCost?: number;
   phases: Phase[];
   assignedTechs: string[];
+  phaseHistory?: PhaseHistory[];
+  daysInRepair?: number;
+  isOverdue?: boolean;
+  isRework?: boolean;
+  reworkReason?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -119,7 +124,7 @@ export interface Lift {
 
 export interface QRPayload {
   type: 'part_scan' | 'vehicle_checkin' | 'work_completion';
-  data: Record<string, unknown>;
+  data: Record<string, any>;
   timestamp: Date;
   scannedBy: string;
 }
@@ -184,6 +189,14 @@ export interface CoreItem {
   status: 'available' | 'sold' | 'pending';
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface PhaseHistory {
+  phaseId: string;
+  phaseName: string;
+  status: 'started' | 'completed';
+  timestamp: Date;
+  techId: string;
 }
 
 // Additional utility types
